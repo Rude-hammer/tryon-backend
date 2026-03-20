@@ -7,7 +7,7 @@ import os, base64, time, json
 import httpx, replicate, stripe
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator as validator
+from pydantic import BaseModel, validator
 from collections import defaultdict
 import logging
 
