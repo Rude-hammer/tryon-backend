@@ -1,6 +1,7 @@
 """
-TryOn Backend v6 - LightX API powered virtual try-on
-Free tier: 25 credits on signup, no credit card needed
+TryOn Backend v7 - LightX API (correct endpoint)
+Endpoint: https://api.lightxeditor.com/external/api/v2/aivirtualtryon
+Needs: imageUrl (person) + styleImageUrl (clothing) - both must be URLs
 """
 import os, base64, time, json, asyncio
 import httpx, stripe
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
 
-app = FastAPI(title="TryOn API", version="6.0.0")
+app = FastAPI(title="TryOn API", version="7.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
     allow_methods=["POST","GET","OPTIONS"], allow_headers=["Content-Type","stripe-signature"])
 
@@ -58,8 +59,8 @@ def get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 class TryOnRequest(BaseModel):
-    person_image: str
-    cloth_image_url: str
+    person_image: str        # base64 data URL
+    cloth_image_url: str     # direct URL from Amazon/Flipkart
     platform: str = "amazon"
     user_email: str = ""
 
@@ -108,7 +109,7 @@ def can_try_on(user: dict) -> tuple:
     return True, "ok", max(0, limit - used)
 
 @app.get("/")
-def root(): return {"status":"ok","service":"TryOn API v6.0"}
+def root(): return {"status":"ok","service":"TryOn API v7.0"}
 
 @app.get("/health")
 def health(): return {"status":"healthy","global_calls_today":_global["daily_calls"],"global_daily_cap":GLOBAL_DAILY_CAP}
@@ -209,65 +210,67 @@ async def try_on(request_data: TryOnRequest, request: Request):
                 "tries_remaining": 0,
             }))
 
-    try:
-        # Step 1: Upload person image to LightX
-        logger.info("Uploading person image to LightX...")
-        headers = {"x-api-key": lightx_key, "Content-Type": "application/json"}
+    headers = {"x-api-key": lightx_key, "Content-Type": "application/json"}
 
+    try:
+        # Step 1: Upload person image to a temp host so LightX can access it via URL
+        # We use api.lightxeditor.com's own upload endpoint
+        logger.info("Getting upload URL from LightX...")
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Get upload URL for person image
             upload_resp = await client.post(
                 "https://api.lightxeditor.com/external/api/v1/uploadImageUrl",
                 headers=headers,
-                json={"uploadType": "imageUrl", "size": len(request_data.person_image)}
+                json={"uploadType": "imageUrl"}
             )
+            logger.info(f"Upload URL response: {upload_resp.status_code} {upload_resp.text[:200]}")
+
             if upload_resp.status_code != 200:
-                logger.error(f"LightX upload error: {upload_resp.text}")
-                raise HTTPException(500, "Failed to prepare image upload")
+                raise HTTPException(500, f"Failed to get upload URL: {upload_resp.text[:200]}")
 
             upload_data = upload_resp.json()
-            model_image_url = upload_data.get("data", {}).get("imageUrl", "")
-            upload_url = upload_data.get("data", {}).get("uploadUrl", "")
+            person_image_url = upload_data.get("data", {}).get("imageUrl", "")
+            put_url = upload_data.get("data", {}).get("uploadUrl", "")
 
-            if not upload_url:
-                raise HTTPException(500, "No upload URL from LightX")
+            if not put_url or not person_image_url:
+                raise HTTPException(500, f"No upload URL in response: {upload_data}")
 
-            # Upload person image bytes
+            # Upload person image
             _, encoded = request_data.person_image.split(",", 1)
             person_bytes = base64.b64decode(encoded)
 
             put_resp = await client.put(
-                upload_url,
+                put_url,
                 content=person_bytes,
                 headers={"Content-Type": "image/jpeg"}
             )
+            logger.info(f"PUT upload response: {put_resp.status_code}")
             if put_resp.status_code not in (200, 201):
                 raise HTTPException(500, "Failed to upload person image")
 
-        # Step 2: Run virtual try-on
-        logger.info("Running LightX virtual try-on...")
+        # Step 2: Call virtual try-on with both URLs
+        logger.info("Calling LightX virtual try-on...")
         async with httpx.AsyncClient(timeout=30.0) as client:
             tryon_resp = await client.post(
-                "https://api.lightxeditor.com/external/api/v1/virtualTryOn",
+                "https://api.lightxeditor.com/external/api/v2/aivirtualtryon",
                 headers=headers,
                 json={
-                    "modelImageUrl": model_image_url,
-                    "clothImageUrl": request_data.cloth_image_url,
-                    "clothType": "upper",
+                    "imageUrl": person_image_url,
+                    "styleImageUrl": request_data.cloth_image_url,
                 }
             )
+            logger.info(f"TryOn response: {tryon_resp.status_code} {tryon_resp.text[:300]}")
+
             if tryon_resp.status_code != 200:
-                logger.error(f"LightX tryon error: {tryon_resp.text}")
-                raise HTTPException(500, "Try-on request failed")
+                raise HTTPException(500, f"Try-on failed: {tryon_resp.text[:200]}")
 
             tryon_data = tryon_resp.json()
             order_id = tryon_data.get("data", {}).get("orderId", "")
             if not order_id:
-                raise HTTPException(500, "No order ID from LightX")
+                raise HTTPException(500, f"No order ID: {tryon_data}")
 
         # Step 3: Poll for result
-        logger.info(f"Polling for result, order: {order_id}")
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        logger.info(f"Polling order: {order_id}")
+        async with httpx.AsyncClient(timeout=15.0) as client:
             for attempt in range(40):
                 await asyncio.sleep(3)
                 status_resp = await client.post(
@@ -277,12 +280,12 @@ async def try_on(request_data: TryOnRequest, request: Request):
                 )
                 status_data = status_resp.json()
                 status = status_data.get("data", {}).get("status", "")
-                logger.info(f"LightX status [{attempt}]: {status}")
+                logger.info(f"Status [{attempt}]: {status}")
 
                 if status == "active":
                     result_url = status_data.get("data", {}).get("output", "")
                     if not result_url:
-                        raise HTTPException(500, "No output image from LightX")
+                        raise HTTPException(500, "No output image")
 
                     if user:
                         if user["subscription"] == "free":
@@ -292,7 +295,7 @@ async def try_on(request_data: TryOnRequest, request: Request):
 
                     _, _, remaining_after = can_try_on(user) if user else (True, "ok", 999)
                     elapsed = round(time.time() - start, 2)
-                    logger.info(f"Try-on done in {elapsed}s")
+                    logger.info(f"Done in {elapsed}s")
                     return {
                         "result_url": result_url,
                         "processing_time": elapsed,
@@ -301,16 +304,17 @@ async def try_on(request_data: TryOnRequest, request: Request):
                     }
 
                 elif status in ("failed", "error"):
-                    raise HTTPException(500, "Try-on processing failed")
+                    err = status_data.get("data", {}).get("message", "Unknown")
+                    raise HTTPException(500, f"Try-on failed: {err}")
 
-            raise HTTPException(408, "Try-on timed out. Please try again.")
+            raise HTTPException(408, "Timed out after 120 seconds. Please try again.")
 
     except HTTPException: raise
     except httpx.TimeoutException:
         raise HTTPException(408, "Request timed out. Please try again.")
     except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        raise HTTPException(500, "Internal server error")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        raise HTTPException(500, f"Internal server error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
